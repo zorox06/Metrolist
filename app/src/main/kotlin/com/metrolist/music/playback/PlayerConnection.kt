@@ -467,8 +467,8 @@ class PlayerConnection(
 
             val currentTime = LocalTime.now()
             val today = LocalDate.now()
-            val dayOfWeek = today.dayOfWeek.value % 7
-            val adjustedDayOfWeek = if (dayOfWeek == 0) 6 else dayOfWeek - 1
+            // dayOfWeek.value: Mon=1..Sun=7 → adjustedDayOfWeek: Mon=0..Sun=6
+            val adjustedDayOfWeek = today.dayOfWeek.value - 1
 
             Timber.tag(TAG).d("Current: time=$currentTime dayOfWeek=$adjustedDayOfWeek")
 
@@ -594,8 +594,7 @@ class PlayerConnection(
             canSkipPrevious.value = player.isCommandAvailable(COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM) ||
                     !window.isLive ||
                     player.isCommandAvailable(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
-            canSkipNext.value = window.isLive &&
-                    window.isDynamic ||
+            canSkipNext.value = (window.isLive && window.isDynamic) ||
                     player.isCommandAvailable(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
         } else {
             canSkipPrevious.value = false

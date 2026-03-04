@@ -379,18 +379,18 @@ class MusicService :
     private var silenceSkipJob: Job? = null
 
     // URL cache for stream URLs - class-level so it can be invalidated on errors
-    private val songUrlCache = HashMap<String, Pair<String, Long>>()
+    private val songUrlCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
 
     // Flag to bypass cache when quality changes - forces fresh stream fetch
     private val bypassCacheForQualityChange = mutableSetOf<String>()
 
     // Enhanced error tracking for strict retry management
-    private var currentMediaIdRetryCount = mutableMapOf<String, Int>()
+    private var currentMediaIdRetryCount = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private val MAX_RETRY_PER_SONG = 3
     private val RETRY_DELAY_MS = 1000L
 
     // Track failed songs to prevent infinite retry loops
-    private val recentlyFailedSongs = mutableSetOf<String>()
+    private val recentlyFailedSongs: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
     private var failedSongsClearJob: Job? = null
 
     // Google Cast support
@@ -930,10 +930,12 @@ class MusicService :
                 }.onSuccess { playerState ->
                     // Restore player settings after queue is loaded
                     scope.launch {
-                        delay(1000) // Wait for queue to be loaded
-                        // Don't restore repeat/shuffle from playerState as they are already set from DataStore (source of truth)
-                        // player.repeatMode = playerState.repeatMode
-                        // player.shuffleModeEnabled = playerState.shuffleModeEnabled
+                        // Wait for queue to actually be loaded instead of hard-coded delay
+                        var waited = 0L
+                        while (player.mediaItemCount == 0 && waited < 5000L) {
+                            delay(100)
+                            waited += 100
+                        }
                         playerVolume.value = playerState.volume
 
                         // Restore position if it's still valid
@@ -951,7 +953,9 @@ class MusicService :
         // Save queue periodically to prevent queue loss from crash or force kill
         scope.launch {
             while (isActive) {
-                delay(15.seconds)
+                // Save more frequently when playing (10s) vs idle (30s)
+                val interval = if (player.isPlaying) 10.seconds else 30.seconds
+                delay(interval)
                 if (dataStore.get(PersistentQueueKey, true)) {
                     saveQueueToDisk()
                 }
@@ -960,16 +964,6 @@ class MusicService :
                 if (currentMetadata?.isEpisode == true && player.isPlaying && player.currentPosition > 0) {
                     previousEpisodePosition = player.currentPosition
                     saveEpisodePosition(currentMetadata.id, player.currentPosition)
-                }
-            }
-        }
-
-        // Save queue more frequently when playing to ensure state is preserved
-        scope.launch {
-            while (isActive) {
-                delay(10.seconds)
-                if (dataStore.get(PersistentQueueKey, true) && player.isPlaying) {
-                    saveQueueToDisk()
                 }
             }
         }
@@ -1065,13 +1059,13 @@ class MusicService :
             }
 
             AudioManager.AUDIOFOCUS_LOSS -> {
-                hasAudioFocus = false
                 audioFocusVolumeMultiplier.value = 1f
                 wasPlayingBeforeAudioFocusLoss = player.isPlaying
                 if (player.isPlaying) {
                     player.pause()
                 }
                 abandonAudioFocus()
+                hasAudioFocus = false
                 lastAudioFocusState = focusChange
             }
 
@@ -1962,7 +1956,7 @@ class MusicService :
 
         // Force Repeat One if the player ignored it and auto-advanced
         if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-            val repeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
+            val repeatMode = dataStore.get(RepeatModeKey, REPEAT_MODE_OFF)
             if (repeatMode == REPEAT_MODE_ONE &&
                 previousMediaItemIndex != C.INDEX_UNSET &&
                 previousMediaItemIndex != player.currentMediaItemIndex
@@ -2036,7 +2030,7 @@ class MusicService :
     ) {
         // Force Repeat All if the player ignored it and ended playback
         if (playbackState == Player.STATE_ENDED) {
-            val repeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
+            val repeatMode = dataStore.get(RepeatModeKey, REPEAT_MODE_OFF)
             if (repeatMode == REPEAT_MODE_ALL && player.mediaItemCount > 0) {
                 player.seekTo(0, 0)
                 player.prepare()
@@ -2138,7 +2132,7 @@ class MusicService :
                 )
             ) {
                 scope.launch {
-                    discordRpc?.close()
+                    discordRpc?.closeRPC()
                 }
             }
         }
@@ -2241,8 +2235,7 @@ class MusicService :
             }
             player.setShuffleOrder(DefaultShuffleOrder(shuffledIndices, System.currentTimeMillis()))
         } else {
-            val shuffledIndices = IntArray(totalCount) { it }
-            shuffledIndices.shuffle()
+            val shuffledIndices = (0 until totalCount).toMutableList().apply { shuffle() }.toIntArray()
             // Ensure current item is first in the shuffle order
             val currentItemIndexInShuffled = shuffledIndices.indexOf(currentIndex)
             if (currentItemIndexInShuffled != -1) { // Should always be true if totalCount > 0
@@ -2910,10 +2903,10 @@ class MusicService :
                             id = mediaId,
                             itag = format.itag,
                             mimeType = format.mimeType.split(";")[0],
-                            codecs = format.mimeType.split("codecs=")[1].removeSurrounding("\""),
+                            codecs = format.mimeType.substringAfter("codecs=", "unknown").removeSurrounding("\""),
                             bitrate = format.bitrate,
                             sampleRate = format.audioSampleRate,
-                            contentLength = format.contentLength!!,
+                            contentLength = format.contentLength ?: 0L,
                             loudnessDb = loudnessDb,
                             perceptualLoudnessDb = perceptualLoudnessDb,
                             playbackUrl = nonNullPlayback.playbackTracking?.videostatsPlaybackUrl?.baseUrl
@@ -3198,7 +3191,7 @@ class MusicService :
                 if (player.isPlaying) {
                     updateWidgetUI(true)
                 }
-                delay(200)
+                delay(1000)
             }
         }
     }
@@ -3302,8 +3295,8 @@ class MusicService :
 
         // Preserve player state before creating the secondary player
         // Use runBlocking to ensure we get the correct state from DataStore
-        val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
-        val savedShuffleEnabled = runBlocking { dataStore.get(ShuffleModeKey, false) }
+        val savedRepeatMode = dataStore.get(RepeatModeKey, REPEAT_MODE_OFF)
+        val savedShuffleEnabled = dataStore.get(ShuffleModeKey, false)
 
         // For repeat-one, crossfade back into the same track
         val targetIndex = if (savedRepeatMode == REPEAT_MODE_ONE) {
@@ -3418,7 +3411,7 @@ class MusicService :
 
             try {
                 fadingPlayer?.volume = 0f
-                player.volume = startVolume
+                applyEffectiveVolume() // BUG-12: Restore effective volume respecting mute/sleep timer/focus
                 cleanupCrossfade()
             } catch (e: Exception) {
             }
@@ -3426,6 +3419,8 @@ class MusicService :
     }
 
     private fun cleanupCrossfade() {
+        // BUG-13: Clean up silence processor reference before releasing player
+        fadingPlayer?.let { playerSilenceProcessors.remove(it) }
         fadingPlayer?.stop()
         fadingPlayer?.clearMediaItems()
         fadingPlayer?.release()
